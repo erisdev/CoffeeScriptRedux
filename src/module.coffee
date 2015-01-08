@@ -4,6 +4,7 @@ Nodes = require './nodes'
 Parser = require './parser'
 {Optimiser} = require './optimiser'
 {Compiler} = require './compiler'
+{MacroExpander} = require './macro-expander'
 cscodegen = try require 'cscodegen'
 escodegen = try require 'escodegen'
 
@@ -24,6 +25,7 @@ CoffeeScript =
 
   CoffeeScript: CoffeeScript
   Compiler: Compiler
+  MacroExpander: MacroExpander
   Optimiser: Optimiser
   Parser: Parser
   Preprocessor: Preprocessor
@@ -43,7 +45,7 @@ CoffeeScript =
       throw new Error formatParserError preprocessed, e
 
   compile: (csAst, options) ->
-    (Compiler.compile csAst, options).toBasicObject()
+    (Compiler.compile MacroExpander.expand(csAst), options).toBasicObject()
 
   # TODO
   cs: (csAst, options) ->

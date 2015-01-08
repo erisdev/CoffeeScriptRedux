@@ -1,4 +1,4 @@
-suite 'Macros', ->
+suite 'Special Constants', ->
 
   test '__LINE__', ->
     eq 4, __LINE__
