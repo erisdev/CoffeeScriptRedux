@@ -1,5 +1,7 @@
-fs = require 'fs'
+fs = try require 'fs'
+vm = try require 'vm'
 escodegen = require 'escodegen'
+{SourceMapConsumer} = require 'source-map'
 
 {Compiler} = require './compiler'
 {union} = require './functional-helpers'
@@ -8,43 +10,23 @@ nodeTypes = require './nodes'
 
 exports = module?.exports ? this
 
-evalInGlobalContext = eval
-getFunc = (ast) ->
-  # if bindings?
-  #   bindingNames = []
-  #   bindingValues = []
-  #   for k, v of bindings
-  #     bindingNames.push k
-  #     bindingValues.push v
-  #   ast = new nodeTypes.Function(bindingNames, ast)
-  jsAST = Compiler.compile(ast, bare:yes).toBasicObject()
-  {map, code} = escodegen.generate jsAST,
-    sourceMapWithCode:yes
-    sourceMap: '(macro)' # TODO figure out real filename
-  func = evalInGlobalContext "(#{code})"
-  # func = func.apply null, bindingValues if bindings?
-  func.sourceMap = map
+hideFromStackTrace = (func) ->
+  func.hideFromStackTrace = yes
   func
 
-callFunc = (func, obj, args = [], useLocation, name) ->
-  try
-    func.apply obj, args
-  catch e
-    throw e if e instanceof SyntaxError
-    e.srcMap = func.sourceMap
-    throw e
+terminateStackTrace = (func) ->
+  func.terminateStackTrace = yes
+  func
 
-callFunc.stopStackTrace = yes
-
-execNode = (node, context, bindings) ->
-  if bindings?
-    params = []
-    args = []
-    for k, v of bindings
-      params.push k
-      args.push v
-  funcNode = new nodeTypes.Function(params ? '', node)
-  callFunc getFunc(funcNode), context, args
+evalAsFile = hideFromStackTrace do ->
+  if vm?
+    (code, filename) -> vm.runInThisContext "(#{code})", filename
+  else do ->
+    # calling eval from an alias executes in the global context
+    eval_ = eval
+  
+    (code, filename) ->
+      eval_ "(#{code})\n//@ sourceURL=#{filename}"
 
 nodeToId = (node, dotted = no) ->
   if node instanceof nodeTypes.Identifier
@@ -59,18 +41,6 @@ getCalleeName = (node) ->
   if node instanceof nodeTypes.FunctionApplications
     nodeToId node.function, yes
 
-getLocation = (node) ->
-  if node.line? # assume this means other location information is available
-    loc =
-      line: @line = node.line
-      column: @column = node.column
-      offset: node.offset
-
-addMacroParameters = (node) ->
-  node.parameters.unshift new nodeTypes.Identifier('cs')
-  node.parameters.unshift new nodeTypes.Identifier('macro')
-  node
-
 unwrap = (node) ->
   if node.body?
     unwrap node.body
@@ -78,7 +48,7 @@ unwrap = (node) ->
     unwrap node.statements[0]
   else node
 
-transform = do ->
+transform = hideFromStackTrace do ->
   _handleReturn = (node, res, nullOK) ->
     if res is yes then node
     else if res instanceof nodeTypes.Nodes then res
@@ -108,12 +78,7 @@ transform = do ->
           node[childName] = new nodeTypes.Undefined
     node
 
-  # (ast, visit) ->
-  #   transform ast, (node) ->
-  #     console.log 'visiting', node
-  #     visit node
-
-walk = (node, visit) ->
+walk = hideFromStackTrace (node, visit) ->
   for childName in node.childNodes when node[childName]?
     if childName in node.listMembers
       visit walk(child, visit) for child in node[childName]
@@ -130,32 +95,36 @@ class exports.MacroExpander
     macro.expand csAst, options
 
   builtinMacros:
-    macro: (macro, cs, node) ->
-      if node instanceof cs.Function
+    macro: (node) ->
+      bindMacro = (node, name) =>
+        @getFunc(node, name, macro:@helpers, cs:nodeTypes)
+      
+      if node instanceof nodeTypes.Function
         throw new Error('macro expects a closure with no parameters') if node.parameters.length
-        callFunc getFunc(addMacroParameters node), this, [macro, cs], '(macro)'
+        @callMacro bindMacro(node), []
       else if (name = getCalleeName(node))?
-        throw new Error("macro expects a closure after identifier") unless node.arguments.length is 1 and node.arguments[0] instanceof cs.Function
-        @__macros[name] = getFunc(addMacroParameters node.arguments[0])
+        throw new Error("macro expects a closure after identifier") unless node.arguments.length is 1 and node.arguments[0] instanceof nodeTypes.Function
+        @macros[name] = bindMacro(node.arguments[0], name)
         no
       else
         throw new Error("macro expects a closure or identifier")
 
-    'macro.quote': (macro, cs, func) ->
-      if func not instanceof cs.Function or func.parameters.length
+    'macro.quote': (func) ->
+      if func not instanceof nodeTypes.Function or func.parameters.length
         throw new Error('macro.codeToNode expects a closure with no parameters')
-      @__codeNodes.push func.body
-      macro.parse "@__codeNodes[#{@__codeNodes.length - 1}]"
+      @context.__codeNodes.push func.body
+      @helpers.parse "@__codeNodes[#{@context.__codeNodes.length - 1}]"
 
   # included in the namespace of all macros as 'macro'
-  helpers:
+  builtinHelpers:
     require: require
     nodeToId: nodeToId
     transform: transform
+    unwrap: unwrap
     walk: walk
 
-    eval: (node, context = @__context) ->
-      execNode(node, context) if node?
+    eval: (node, context, bindings) ->
+      @execNode(node, context, bindings) if node?
 
     uneval: (obj) ->
       if obj instanceof nodeTypes.Nodes
@@ -172,12 +141,12 @@ class exports.MacroExpander
           when 'object'
             if Array.isArray(obj)
               new nodeTypes.ArrayInitialiser(
-                @uneval(item) for item in obj
+                @helpers.uneval(item) for item in obj
               )
             else
               new nodeTypes.ObjectInitialiser(
                 for key, value of obj
-                  continue unless node = @uneval(value)
+                  continue unless node = @helpers.uneval(value)
                   new nodeTypes.ObjectInitialiserMember(new nodeTypes.String(key), node)
               )
           else new nodeTypes.Undefined
@@ -191,38 +160,140 @@ class exports.MacroExpander
     parseFile: (filename) ->
       code = fs.readFileSync(filename, 'utf8')
       code = code.substr 1 if code.charCodeAt(0) is 0xFEFF
-      @parse code, filename
+      @helpers.parse code, filename
 
     backquote: (values, ast) ->
       transform ast, (node) =>
-        if (name = @nodeToId(node)) and values.hasOwnProperty(name)
-          @uneval(values[name])
+        if (name = @helpers.nodeToId(node)) and values.hasOwnProperty(name)
+          @helpers.uneval(values[name])
         else yes
 
+    define: (name, func) ->
+      @defineMacro name, func
+    
+    call: (name, args...) ->
+      @callMacro name, args
+
   constructor: ->
-    @macros = Object.create @builtinMacros
+    bind = (func) =>
+      bound = func.bind(this)
+      # for debugging purposes
+      bound.toString = => "// (bound to MacroExpander)\n#{func}"
+      bound
+      
+    @macros = {}
+    @defineMacro(k, bind v) for k, v of @builtinMacros
+    
+    @helpers = {}
+    @helpers[k] = bind(v) for k, v of @builtinHelpers
+    
+    @filenameStack = []
+    @filename = '<internal>'
+    
+    @sourceMaps = {}
+    
     @context =
       __macros:@macros
       __codeNodes:[]
 
   defineMacro: (name, fn) ->
     @macros[name] = fn
+    fn.displayName ?= "<macro #{name}>"
+    fn
 
+  callMacro: (name, args) ->
+    if typeof name is 'function'
+      func = name
+    else if name of @macros
+      func = @macros[name]
+    else
+      throw new Error("undefined macro: #{name}")
+    
+    func.apply @context, args
+
+  pushFile: (newFile = '<unknown>') ->
+    @filenameStack.push @filename
+    @filename = newFile
+  
+  popFile: ->
+    @filename = @filenameStack.pop()
+  
+  nextId = 0
+  getFunc: (node, name = "<anonymous macro #{nextId++}>", bindings) ->
+    params = []
+    args = []
+  
+    if bindings?
+      for k, v of bindings
+        params.push new nodeTypes.Identifier(k)
+        args.push v
+  
+    csAst = new nodeTypes.Function(params, node)
+    jsAST = Compiler.compile(csAst, bare:yes).toBasicObject()
+    {map, code} = escodegen.generate jsAST,
+      sourceMapWithCode: yes
+      sourceMap: @filename
+    
+    if map = map?.toJSON()
+      sourceMapId = "#{@filename}\##{name}"
+      @sourceMaps[sourceMapId] = map
+    
+    func = evalAsFile(code, sourceMapId).apply(null, args)
+    func.displayName = "<macro #{name}>"
+    func
+
+  execNode: (node, context = @context, bindings) ->
+    funcNode = new nodeTypes.Function([], node)
+    @getFunc(funcNode, null, bindings).call context
+  
+  prepareStackTrace: (error, stack) ->
+    [
+      "#{error.name}: #{error.message}"
+      (
+        for frame in stack
+          func = frame.getFunction()
+          name = func.displayName ? frame.getFunctionName() ? '<anonymous>'
+          filename = frame.getFileName()
+          
+          break if func.terminateStackTrace
+          continue if func.hideFromStackTrace
+          
+          if filename of @sourceMaps
+            map = new SourceMapConsumer(@sourceMaps[filename])
+            {line, column} = map.originalPositionFor
+              line: frame.getLineNumber()
+              column: frame.getColumnNumber()
+            location = [map.sources[0], line, column]
+          else
+            location = [filename ? '<unknown>']
+        
+          "    #{name} (#{location.join ':'})"
+      )...
+    ].join('\n') + '\n'
+  
+  
   loadMacroDefinitions: (ast) ->
     walk ast, (node) =>
       if getCalleeName(node) is 'macro'
-        args = [@helpers, nodeTypes, (@expand arg for arg in node.arguments)...]
-        callFunc @macros.macro, @context, args, getLocation(node), 'macro'
+        args = (@expand arg for arg in node.arguments)
+        @callMacro 'macro', args
     this
 
-  expand: (ast) ->
-    transform ast, (node) =>
-      if (name = getCalleeName(node))? and @macros.hasOwnProperty(name) or @builtinMacros.hasOwnProperty(name)
-        args = [@helpers, nodeTypes, node.arguments...]
-        try
-          callFunc @macros[name], @context, args, getLocation(node), name
-        catch e
-          console.log require('util').inspect node.toBasicObject(), depth:999
-          throw e
-      else
-        yes
+  expand: (ast, options) ->
+    unless options.fullStackTrace
+      _prepareStackTrace = Error.prepareStackTrace
+      Error.prepareStackTrace = @prepareStackTrace.bind(this)
+    
+    @pushFile options.inputSource
+    try
+      ast = transform ast, terminateStackTrace (node) =>
+        if (name = getCalleeName(node))? and @macros.hasOwnProperty(name)
+          @callMacro name, node.arguments
+        else
+          yes
+    finally
+      @popFile()
+      Error.prepareStackTrace = _prepareStackTrace if _prepareStackTrace?
+    ast
+  
+  hideFromStackTrace(v) for own k, v of @prototype when typeof v is 'function'

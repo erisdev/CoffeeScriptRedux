@@ -45,7 +45,7 @@ CoffeeScript =
       throw new Error formatParserError preprocessed, e
 
   compile: (csAst, options) ->
-    (Compiler.compile MacroExpander.expand(csAst), options).toBasicObject()
+    (Compiler.compile MacroExpander.expand(csAst, options), options).toBasicObject()
 
   # TODO
   cs: (csAst, options) ->

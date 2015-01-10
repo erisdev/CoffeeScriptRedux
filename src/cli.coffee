@@ -245,7 +245,9 @@ else
         process.exit 1
 
     # compile
-    jsAST = CoffeeScript.compile result, bare: options.bare
+    jsAST = CoffeeScript.compile result,
+      bare: options.bare
+      inputSource: inputSource
 
     # --compile
     if options.compile

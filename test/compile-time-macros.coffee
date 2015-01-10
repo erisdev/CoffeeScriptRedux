@@ -83,9 +83,8 @@ suite 'Compile Time Macros', ->
   test "macro contexts", ->
     macro -> @a = 42
     eq 42, macro -> macro.uneval @a
-    # FIXME context stuff
-    # macro INCR (arg) -> macro.uneval macro.eval(arg)+1
-    # eq 43, INCR @a
+    macro INCR (arg) -> macro.uneval macro.eval(arg)+1
+    eq 43, INCR @a
 
   test "macro call within macro arguments", ->
     macro R1 (arg) -> macro.uneval(macro.eval(arg)+10)
